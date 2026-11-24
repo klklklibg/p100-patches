@@ -1,3 +1,5 @@
+> **已合并到 [P100 LLM Toolkit](https://github.com/klklklibg/p100-llm-toolkit)** — 本仓库保留作为历史存档，后续更新在 monorepo 的 `patches/` 目录。
+
 # P100 / GP100 (sm_60) llama.cpp 补丁集
 
 两个在 Tesla P100 16GB（GP100, sm_60, CUDA 12.4, Windows）上实测过的独立补丁。每个都可单独 cherry-pick 到对应版本的 llama.cpp。
