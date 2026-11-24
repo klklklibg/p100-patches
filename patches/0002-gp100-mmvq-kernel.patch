@@ -1,0 +1,90 @@
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 6f10428e..8449580e 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1,4 +1,5 @@
+ #include "mmvq.cuh"
++#include "mmvq-gp100.cuh"
+ #include "quantize.cuh"
+ #include "unary.cuh"
+ #include "vecdotq.cuh"
+@@ -98,7 +99,8 @@ enum mmvq_parameter_table_id {
+     MMVQ_PARAMETERS_RDNA3_0,
+     MMVQ_PARAMETERS_RDNA4,
+     MMVQ_PARAMETERS_GB10,
+-    MMVQ_PARAMETERS_ORIN
++    MMVQ_PARAMETERS_ORIN,
++    MMVQ_PARAMETERS_PASCAL  // P100/GP100 tuning ported from the Pascal-tuned tree
+ };
+ 
+ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
+@@ -118,6 +120,8 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
+     return MMVQ_PARAMETERS_GB10;
+ #elif __CUDA_ARCH__ == GGML_CUDA_CC_ORIN
+     return MMVQ_PARAMETERS_ORIN;
++#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_PASCAL
++    return MMVQ_PARAMETERS_PASCAL;
+ #else
+     return MMVQ_PARAMETERS_GENERIC;
+ #endif
+@@ -148,6 +152,9 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
+     if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_ORIN) {
+         return MMVQ_PARAMETERS_ORIN;
+     }
++    if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_PASCAL) {
++        return MMVQ_PARAMETERS_PASCAL;
++    }
+     return MMVQ_PARAMETERS_GENERIC;
+ }
+ 
+@@ -609,7 +616,7 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
+         }
+         return generic;
+     }
+-    if (table_id == MMVQ_PARAMETERS_ORIN) {
++    if (table_id == MMVQ_PARAMETERS_ORIN || table_id == MMVQ_PARAMETERS_PASCAL) {
+         return calc_nwarps(type, ncols_dst, MMVQ_PARAMETERS_GENERIC);
+     }
+     return 1;
+@@ -652,6 +659,27 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
+                 return 1;
+         }
+     }
++    if (table_id == MMVQ_PARAMETERS_PASCAL) {
++        // GP100 emulates __dp4a in software, so mul_mat_vec_q is instruction-issue bound
++        // rather than bandwidth bound. Handling several rows per block shares the activation
++        // loads/unpacks between them. Tuned on P100: K-quants rows=4, others rows=2.
++        if (ncols_dst != 1) {
++            return calc_rows_per_block(type, ncols_dst, MMVQ_PARAMETERS_GENERIC, small_k, nwarps);
++        }
++        if (small_k) {
++            return nwarps;
++        }
++        switch (type) {
++            case GGML_TYPE_Q2_K:
++            case GGML_TYPE_Q3_K:
++            case GGML_TYPE_Q4_K:
++            case GGML_TYPE_Q5_K:
++            case GGML_TYPE_Q6_K:
++                return 4;
++            default:
++                return 2;
++        }
++    }
+     if (table_id == MMVQ_PARAMETERS_ORIN) {
+         switch (ncols_dst) {
+             case 1:
+@@ -1550,6 +1578,13 @@ void ggml_cuda_mul_mat_vec_q(
+     const int32_t *  ids_d = ids ? (const int32_t *)  ids->data : nullptr;
+     float         *  dst_d =       (float         *)  dst->data;
+ 
++    // GP100 (sm_60) hand-written fp16 MMVQ path: ~10x closer to fp64 than q8_1,
++    // and fuses MoE gate/up/GLU in one pass. Ported from the Pascal-tuned tree.
++    if (ggml_cuda_gp100_mmvq_supported(ggml_cuda_info().devices[ctx.device].cc, src0, src1, ids, dst, fusion)) {
++        ggml_cuda_gp100_mmvq(ctx, src0, src1, ids, dst, fusion);
++        return;
++    }
++
+     ggml_cuda_mm_fusion_args_device fusion_local{};
+ 
+     if (fusion) {
